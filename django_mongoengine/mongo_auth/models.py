@@ -1,24 +1,24 @@
 from django.utils.encoding import smart_str
 from django.utils.translation import ugettext_lazy as _
 from django.utils import timezone
-from django.conf import settings
 from django.contrib.auth.models import (
     AbstractBaseUser,
     _user_has_perm, _user_get_all_permissions, _user_has_module_perms,
 )
 from django.db import models
-from django.contrib.contenttypes.models import ContentTypeManager
 from django.contrib import auth
 
 from bson.objectid import ObjectId
-from mongoengine import ImproperlyConfigured
+from mongoengine import ImproperlyConfigured, CASCADE, PULL
 
 from django_mongoengine import document
 from django_mongoengine import fields
 from .managers import MongoUserManager
 
+UNUSABLE_PASSWORD_PREFIX = '!'  # This will never be a valid encoded hash
+
 try:
-    from django.contrib.auth.hashers import check_password, make_password
+    from django.contrib.auth.hashers import check_password, make_password, is_password_usable
 except ImportError:
     """Handle older versions of Django"""
     from django.utils.hashcompat import md5_constructor, sha_constructor
@@ -30,6 +30,12 @@ except ImportError:
         elif algorithm == 'sha1':
             return sha_constructor(salt + raw_password).hexdigest()
         raise ValueError('Got unknown password algorithm type in password')
+
+    def is_password_usable(encoded):
+        if encoded is None or encoded.startswith(UNUSABLE_PASSWORD_PREFIX):
+            return False
+        # assumes is true - don't need to handle older previous for ericsson's needs yet
+        return True
 
     def check_password(raw_password, password):
         algo, salt, hash = password.split('$')
@@ -47,6 +53,148 @@ class BaseUser(object):
 
     is_anonymous = AbstractBaseUser.__dict__['is_anonymous']
     is_authenticated = AbstractBaseUser.__dict__['is_authenticated']
+
+#from mongoengine.queryset.manager import QuerySetManager
+from mongoengine.queryset.base import BaseQuerySet
+from django_mongoengine.queryset import QuerySetManager
+BaseQuerySet._prefetch_related_lookups = True
+
+
+class OptionalEmailField(fields.EmailField):
+
+    def validate(self, value):
+        if not value:
+            return
+        super().validate(value)
+
+
+class ContentTypeManager(QuerySetManager):
+    use_in_migrations = True
+
+    def __init__(self, *args, **kwargs):
+        super(ContentTypeManager, self).__init__(*args, **kwargs)
+        # Cache shared by all the get_for_* methods to speed up
+        # ContentType retrieval.
+        self._cache = {}
+
+    def get_by_natural_key(self, app_label, model):
+        try:
+            ct = self._cache[self.db][(app_label, model)]
+        except KeyError:
+            ct = self.get(app_label=app_label, model=model)
+            self._add_to_cache(self.db, ct)
+        return ct
+
+    def _get_opts(self, model, for_concrete_model):
+        if for_concrete_model:
+            model = model._meta.concrete_model
+        return model._meta
+
+    def _get_from_cache(self, opts):
+        key = (opts.app_label, opts.model_name)
+        return self._cache[self.db][key]
+
+    def get_for_model(self, model, for_concrete_model=True):
+        """
+        Returns the ContentType object for a given model, creating the
+        ContentType if necessary. Lookups are cached so that subsequent lookups
+        for the same model don't hit the database.
+        """
+        opts = self._get_opts(model, for_concrete_model)
+        try:
+            return self._get_from_cache(opts)
+        except KeyError:
+            pass
+
+        # The ContentType entry was not found in the cache, therefore we
+        # proceed to load or create it.
+        try:
+            # Start with get() and not get_or_create() in order to use
+            # the db_for_read (see #20401).
+            ct = self.get(app_label=opts.app_label, model=opts.model_name)
+        except self.model.DoesNotExist:
+            # Not found in the database; we proceed to create it. This time
+            # use get_or_create to take care of any race conditions.
+            ct, created = self.get_or_create(
+                app_label=opts.app_label,
+                model=opts.model_name,
+            )
+        self._add_to_cache(self.db, ct)
+        return ct
+
+    def get_for_models(self, *models, **kwargs):
+        """
+        Given *models, returns a dictionary mapping {model: content_type}.
+        """
+        for_concrete_models = kwargs.pop('for_concrete_models', True)
+        # Final results
+        results = {}
+        # models that aren't already in the cache
+        needed_app_labels = set()
+        needed_models = set()
+        needed_opts = set()
+        for model in models:
+            opts = self._get_opts(model, for_concrete_models)
+            try:
+                ct = self._get_from_cache(opts)
+            except KeyError:
+                needed_app_labels.add(opts.app_label)
+                needed_models.add(opts.model_name)
+                needed_opts.add(opts)
+            else:
+                results[model] = ct
+        if needed_opts:
+            cts = self.filter(
+                app_label__in=needed_app_labels,
+                model__in=needed_models
+            )
+            for ct in cts:
+                model = ct.model_class()
+                if model._meta in needed_opts:
+                    results[model] = ct
+                    needed_opts.remove(model._meta)
+                self._add_to_cache(self.db, ct)
+        for opts in needed_opts:
+            # These weren't in the cache, or the DB, create them.
+            ct = self.create(
+                app_label=opts.app_label,
+                model=opts.model_name,
+            )
+            self._add_to_cache(self.db, ct)
+            results[ct.model_class()] = ct
+        return results
+
+    def get_for_id(self, id):
+        """
+        Lookup a ContentType by ID. Uses the same shared cache as get_for_model
+        (though ContentTypes are obviously not created on-the-fly by get_by_id).
+        """
+        try:
+            ct = self._cache[self.db][id]
+        except KeyError:
+            # This could raise a DoesNotExist; that's correct behavior and will
+            # make sure that only correct ctypes get stored in the cache dict.
+            ct = self.get(pk=id)
+            self._add_to_cache(self.db, ct)
+        return ct
+
+    def clear_cache(self):
+        """
+        Clear out the content-type cache. This needs to happen during database
+        flushes to prevent caching of "stale" content type IDs (see
+        django.contrib.contenttypes.management.update_contenttypes for where
+        this gets called).
+        """
+        self._cache.clear()
+
+    def _add_to_cache(self, using, ct):
+        """Insert a ContentType into the cache."""
+        # Note it's possible for ContentType objects to be stale; model_class() will return None.
+        # Hence, there is no reliance on model._meta.app_label here, just using the model fields instead.
+        key = (ct.app_label, ct.model)
+        self._cache.setdefault(using, {})[key] = ct
+        self._cache.setdefault(using, {})[ct.id] = ct
+    _prefetch_related_lookups = False
 
 
 class ContentType(document.Document):
@@ -88,7 +236,7 @@ class SiteProfileNotAvailable(Exception):
     pass
 
 
-class PermissionManager(models.Manager):
+class PermissionManager(QuerySetManager):
     def get_by_natural_key(self, codename, app_label, model):
         return self.get(
             codename=codename,
@@ -118,8 +266,8 @@ class Permission(document.Document):
     Three basic permissions -- add, change and delete -- are automatically
     created for each Django model.
     """
-    name = fields.StringField(max_length=50, verbose_name=_('username'))
-    content_type = fields.ReferenceField(ContentType)
+    name = fields.StringField(max_length=50, verbose_name=_('name'))
+    content_type = fields.ReferenceField(ContentType, reverse_delete_rule=CASCADE)
     codename = fields.StringField(max_length=100, verbose_name=_('codename'))
         # FIXME: don't access field of the other class
         # unique_with=['content_type__app_label', 'content_type__model'])
@@ -134,14 +282,18 @@ class Permission(document.Document):
 
     def __unicode__(self):
         return u"%s | %s | %s" % (
-            unicode(self.content_type.app_label),
-            unicode(self.content_type),
-            unicode(self.name))
+            (self.content_type.app_label),
+            (self.content_type),
+            (self.name))
 
     def natural_key(self):
         return (self.codename,) + self.content_type.natural_key()
     natural_key.dependencies = ['contenttypes.contenttype']
 
+    _prefetch_related_lookups = False
+
+
+fields.ObjectIdField.auto_created = False
 
 class Group(document.Document):
     """Groups are a generic way of categorizing users to apply permissions,
@@ -160,7 +312,8 @@ class Group(document.Document):
     e-mail messages.
     """
     name = fields.StringField(max_length=80, unique=True, verbose_name=_('name'))
-    permissions = fields.ListField(fields.ReferenceField(Permission, verbose_name=_('permissions'), required=False))
+    permissions = fields.ListField(fields.ReferenceField(Permission, reverse_delete_rule=PULL),
+            verbose_name=_('permissions'), blank=True, required=False)
 
     class Meta:
         verbose_name = _('group')
@@ -175,8 +328,8 @@ class AbstractUser(BaseUser, document.Document):
     at http://docs.djangoproject.com/en/dev/topics/auth/#users
     """
     username = fields.StringField(
-        max_length=150, verbose_name=_('username'),
-        help_text=_("Required. 150 characters or fewer. Letters, numbers and @/./+/-/_ characters"),
+        max_length=30, verbose_name=_('username'),
+        help_text=_("Required. 30 characters or fewer. Letters, numbers and @/./+/-/_ characters"),
     )
 
     first_name = fields.StringField(
@@ -185,13 +338,17 @@ class AbstractUser(BaseUser, document.Document):
 
     last_name = fields.StringField(
         max_length=30, blank=True, verbose_name=_('last name'))
-    email = fields.EmailField(verbose_name=_('e-mail address'), blank=True)
+    email = OptionalEmailField(verbose_name=_('e-mail address'), blank=True, required=False)
     password = fields.StringField(
+        # need to set default - to allow django to proceed in two steps
+        # to create user with unusable password
+        default='',
         max_length=128,
         verbose_name=_('password'),
         help_text=_("Use '[algo]$[iterations]$[salt]$[hexdigest]' or use the <a href=\"password/\">change password form</a>."))
     is_staff = fields.BooleanField(
         default=False,
+        blank=True,
         verbose_name=_('staff status'),
         help_text=_("Designates whether the user can log into this admin site."))
     is_active = fields.BooleanField(
@@ -200,6 +357,7 @@ class AbstractUser(BaseUser, document.Document):
         help_text=_("Designates whether this user should be treated as active. Unselect this instead of deleting accounts."))
     is_superuser = fields.BooleanField(
         default=False,
+        blank=True,
         verbose_name=_('superuser status'),
         help_text=_("Designates that this user has all permissions without explicitly assigning them."))
     last_login = fields.DateTimeField(
@@ -210,11 +368,15 @@ class AbstractUser(BaseUser, document.Document):
         verbose_name=_('date joined'))
 
     user_permissions = fields.ListField(
-        fields.ReferenceField(Permission), verbose_name=_('user permissions'),
+        fields.ReferenceField(Permission, reverse_delete_rule=PULL), verbose_name=_('user permissions'),
         blank=True, help_text=_('Permissions for the user.'))
 
-    USERNAME_FIELD = getattr(settings, 'MONGOENGINE_USERNAME_FIELDS', 'username')
-    REQUIRED_FIELDS = getattr(settings, 'MONGOENGINE_USER_REQUIRED_FIELDS', ['email'])
+    groups = fields.ListField(
+        fields.ReferenceField(Group, reverse_delete_rule=PULL), verbose_name=_('user groups'),
+        blank=True, help_text=_('Groups for the user.'))
+
+    USERNAME_FIELD = 'username'
+    REQUIRED_FIELDS = ['email']
 
     meta = {
         'abstract': True,
@@ -224,6 +386,9 @@ class AbstractUser(BaseUser, document.Document):
     }
 
     def __unicode__(self):
+        return self.username
+
+    def get_username(self):
         return self.username
 
     def get_full_name(self):
@@ -249,11 +414,21 @@ class AbstractUser(BaseUser, document.Document):
         """
         return check_password(raw_password, self.password)
 
+    def set_unusable_password(self):
+        """Sets an unusable password,
+        starting with proper django's unusable prefix "!" & random hash"""
+        self.password = make_password(None)
+        self.save()
+        return self
+
+    def has_usable_password(self):
+        return is_password_usable(self.password)
+
     @classmethod
-    def _create_user(cls, username, password, email=None, create_superuser=False):
+    def create_user(cls, username, password, email=None, **kwargs):
         """Create (and save) a new user with the given username, password and
-                email address.
-                """
+        email address.
+        """
         now = timezone.now()
 
         # Normalize the address by lowercasing the domain part of the email
@@ -266,21 +441,10 @@ class AbstractUser(BaseUser, document.Document):
             else:
                 email = '@'.join([email_name, domain_part.lower()])
 
-        user = cls(username=username, email=email, date_joined=now)
+        user = cls(username=username, email=email, date_joined=now, **kwargs)
         user.set_password(password)
-        if create_superuser:
-            user.is_staff = True
-            user.is_superuser = True
         user.save()
         return user
-
-    @classmethod
-    def create_user(cls, username, password, email=None):
-        return cls._create_user(username, password, email)
-
-    @classmethod
-    def create_superuser(cls, username, password, email=None):
-        return cls._create_user(username, password, email, create_superuser=True)
 
     def get_group_permissions(self, obj=None):
         """
@@ -312,17 +476,14 @@ class AbstractUser(BaseUser, document.Document):
 
         # Otherwise we need to check the backends.
         return _user_has_perm(self, perm, obj)
-    
+
     def has_perms(self, perm_list, obj=None):
         """
         Returns True if the user has each of the specified permissions. If
         object is passed, it checks if the user has all required perms for this
         object.
         """
-        for perm in perm_list:
-            if not self.has_perm(perm, obj):
-                return False
-        return True
+        return all(self.has_perm(perm, obj) for perm in perm_list)
 
     def has_module_perms(self, app_label):
         """
@@ -346,6 +507,7 @@ class AbstractUser(BaseUser, document.Document):
         SiteProfileNotAvailable if this site does not allow profiles.
         """
         if not hasattr(self, '_profile_cache'):
+            from django.conf import settings
             if not getattr(settings, 'AUTH_PROFILE_MODULE', False):
                 raise SiteProfileNotAvailable('You need to set AUTH_PROFILE_MO'
                                               'DULE in your project settings')
@@ -369,9 +531,12 @@ class AbstractUser(BaseUser, document.Document):
         return self._profile_cache
 
 
+    @classmethod
+    def normalize_username(cls, username):
+        return username
+
 class User(AbstractUser):
     meta = {'allow_inheritance': True}
-
 
 class MongoUser(BaseUser, models.Model):
     """"
@@ -394,5 +559,28 @@ class MongoUser(BaseUser, models.Model):
         """Doesn't do anything, but works around the issue with Django 1.6."""
         make_password(password)
 
+    @classmethod
+    def normalize_username(cls, username):
+        return username
+    USERNAME_FIELD = 'username'
+    REQUIRED_FIELDS = ['email']
+
+    username = models.CharField(
+        _('username'),
+        max_length=150,
+        unique=True,
+        help_text=_('Required. 150 characters or fewer. Letters, digits and @/./+/-/_ only.'),
+        error_messages={
+            'unique': _("A user with that username already exists."),
+        },
+    )
+    email = models.EmailField(verbose_name=_('e-mail address'), blank=True)
+
 
 MongoUser._meta.pk.to_python = ObjectId
+
+for model in (User, Group, Permission, ContentType):
+    for field in model._fields.values():
+        field.auto_created = False
+
+

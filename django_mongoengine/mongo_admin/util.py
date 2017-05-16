@@ -13,8 +13,13 @@ class RelationWrapper(object):
     Wraps a document referenced from a ReferenceField with an Interface similiar to
     django's ForeignKeyField.rel
     """
-    def __init__(self, document):
+    def __init__(self, field, document):
+        self.field = field
         self.to = document
+        self.model = document
+
+    def get_related_field(self):
+        return self.field
 
 
 def label_for_field(name, model, model_admin=None, return_attr=False):

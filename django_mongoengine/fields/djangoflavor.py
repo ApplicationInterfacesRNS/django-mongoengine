@@ -208,15 +208,24 @@ class ReferenceField(DjangoField):
 
     def formfield(self, **kwargs):
         defaults = {
-          'form_class': formfields.ReferenceField,
-          'queryset': self.document_type.objects,
+            'form_class': formfields.ReferenceField,
+            'queryset': self.document_type.objects,
         }
         defaults.update(kwargs)
         return super(ReferenceField, self).formfield(**defaults)
 
 
+class LazyManager(object):
+
+    def __init__(self, doc_type):
+        self.doc_type = doc_type
+
+    def __getattribute__(self, name):
+        return getattr(object.__getattribute__(self, "doc_type").objects, name)
+
 # TODO: test field.field.choices?
 class ListField(DjangoField):
+    many_to_many = True
 
     def formfield(self, **kwargs):
         if self.field.choices:
@@ -228,7 +237,7 @@ class ListField(DjangoField):
         elif isinstance(self.field, fields.ReferenceField):
             defaults = {
                 'form_class': formfields.DocumentMultipleChoiceField,
-                'queryset': self.field.document_type.objects,
+                'queryset': LazyManager(self.field.document_type),
             }
         else:
             return None

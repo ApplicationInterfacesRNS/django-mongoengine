@@ -1,11 +1,9 @@
 from importlib import import_module
 
 from django.conf import settings
-from django.contrib.auth.models import UserManager
-from django.db.models import CharField, BooleanField, DateTimeField, DateField
-from django.utils import timezone
+from django.contrib.auth.models import UserManager, User as DjUser
+from django.db.models import CharField
 from django.utils.translation import ugettext_lazy as _
-from mongoengine.errors import DoesNotExist
 
 
 MONGOENGINE_USER_DOCUMENT = getattr(
@@ -56,7 +54,7 @@ class MongoUserManager(UserManager):
 
     def contribute_to_class(self, model, name):
         super(MongoUserManager, self).contribute_to_class(model, name)
-        self.dj_model = self.model
+        self.dj_model = DjUser
         self.model = get_user_document()
 
         self.dj_model.USERNAME_FIELD = self.model.USERNAME_FIELD
@@ -68,28 +66,21 @@ class MongoUserManager(UserManager):
             field = CharField(_(name), max_length=30)
             field.contribute_to_class(self.dj_model, name)
 
-        is_staff = BooleanField(_('is_staff'), default=False)
-        is_staff.contribute_to_class(self.dj_model, 'is_staff')
 
-        is_active = BooleanField(_('is_active'), default=False)
-        is_active.contribute_to_class(self.dj_model, 'is_active')
+    def create_user(self, *args, **kwargs):
+        self.model = get_user_document()
+        return super().create_user(*args, **kwargs)
 
-        is_superuser = BooleanField(_('is_superuser'), default=False)
-        is_superuser.contribute_to_class(self.dj_model, 'is_superuser')
-
-        last_login = DateTimeField(_('last_login'), auto_now_add=True)
-        last_login.contribute_to_class(self.dj_model, 'last_login')
-
-        date_joined = DateTimeField(_('date_joined'), auto_now_add=True)
-        date_joined.contribute_to_class(self.dj_model, 'date_joined')
-
+    def create_superuser(self, *args, **kwargs):
+        self.model = get_user_document()
+        return super().create_superuser(*args, **kwargs)
 
     def get(self, *args, **kwargs):
         try:
             return self.get_queryset().get(*args, **kwargs)
-        except DoesNotExist:
+        except get_user_document().DoesNotExist:
             # ModelBackend expects this exception
-            raise self.dj_model.DoesNotExist
+            raise self.dj_model.DoesNotExist()
 
     @property
     def db(self):
@@ -98,9 +89,3 @@ class MongoUserManager(UserManager):
     def get_queryset(self):
         return get_user_document().objects
 
-    def create_superuser(self, username, email, password, **extra_fields):
-        """since we use mongo as our database, we don't use
-        django's rule to create a superuser, such as 'python manage.py createsuperuser'.
-        We use mongo's rule --'python manage.py createmongosuperuser instead.
-        """
-        return get_user_document().create_superuser(username, password, email)

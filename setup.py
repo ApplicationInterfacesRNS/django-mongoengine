@@ -15,11 +15,14 @@ from setuptools import setup, find_packages
 import sys, os
 
 
-__version__ = '0.2.1'
-__description__ = 'Django support for MongoDB via MongoEngine',
+__name__ = 'ericsson-django-mongoengine'
+# use 0.2.1xx  format, last two digits are for ericsson custom
+# RPMs for Integration team does not work with packages version number with more than x.y.z digits
+__version__ = '0.2.107'
+__description__ = 'Django support for MongoDB via MongoEngine'
 __license__ = 'BSD'
-__author__ = 'Ross Lawley',
-__email__ = 'ross.lawley@gmail.com',
+__author__ = 'Ross Lawley'
+__email__ = 'ross.lawley@gmail.com'
 
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -29,7 +32,7 @@ REQUIRES = [i.strip() for i in open("requirements.txt").readlines()]
 
 
 setup(
-    name='django-mongoengine',
+    name=__name__,
     version=__version__,
     url='https://github.com/mongoengine/django-mongoengine',
     download_url='https://github.com/mongoengine/django-mongoengine/tarball/master',

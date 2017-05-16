@@ -1,6 +1,8 @@
 import sys
 import warnings
+import contextlib
 
+from django.apps import apps
 from django.db.models.fields import FieldDoesNotExist
 from django.utils.text import capfirst
 from django.utils.encoding import smart_text
@@ -93,6 +95,9 @@ class DocumentMetaWrapper(object):
         except KeyError:
             pass
 
+        # injects app_config to Document/Model meta
+        self._meta['app_config'] = self.app_config
+
     @property
     def module_name(self):
         """
@@ -106,6 +111,11 @@ class DocumentMetaWrapper(object):
     def get_app_label(self):
         model_module = sys.modules[self.document.__module__]
         return model_module.__name__.split('.')[-2]
+
+    @property
+    def app_config(self):
+        with contextlib.suppress(Exception):
+            return apps.get_app_config(self.get_app_label())
 
     def get_verbose_name(self):
         """

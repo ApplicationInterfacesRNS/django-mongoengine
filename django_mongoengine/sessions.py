@@ -107,6 +107,10 @@ class SessionStore(SessionBase):
             session_key = self.session_key
         MongoSession.objects(session_key=session_key).delete()
 
+    @classmethod
+    def clear_expired(cls):
+        MongoSession.objects.filter(expire_date__lt=datetime_now).delete()
+
 
 class BSONSerializer(object):
     """

@@ -81,7 +81,7 @@ class BaseDocumentAdmin(djmod.BaseModelAdmin):
                 can_add_related = bool(related_modeladmin and
                             related_modeladmin.has_add_permission(request))
                 form_field.widget = widgets.RelatedFieldWidgetWrapper(
-                            form_field.widget, RelationWrapper(db_field.document_type), self.admin_site,
+                            form_field.widget, RelationWrapper(db_field, db_field.document_type), self.admin_site,
                             can_add_related=can_add_related)
                 return form_field
 
@@ -427,10 +427,13 @@ class DocumentAdmin(BaseDocumentAdmin):
         # Then get the history for this object.
         opts = model._meta
         app_label = opts.app_label
-        action_list = LogEntry.objects.filter(
-            object_id=unquote(object_id),
-            content_type=get_content_type_for_model(model)
-        ).select_related().order_by('action_time')
+        # action_list = LogEntry.objects.filter(
+        #     object_id=unquote(object_id),
+        #     content_type=get_content_type_for_model(model)
+        # ).select_related().order_by('action_time')
+
+        # hack - disable history
+        action_list = []
 
         context = dict(self.admin_site.each_context(request),
             title=_('Change history: %s') % force_text(obj),
@@ -450,6 +453,20 @@ class DocumentAdmin(BaseDocumentAdmin):
             "admin/object_history.html"
         ], context)
 
+    @property
+    def media(self):
+        extra = '' if settings.DEBUG else '.min'
+        js = [
+            'core.js',
+            'vendor/jquery/jquery%s.js' % extra,
+            'jquery.init.js',
+            'admin/RelatedObjectLookups.js',
+            'actions%s.js' % extra,
+            'urlify.js',
+            'prepopulate%s.js' % extra,
+            'vendor/xregexp/xregexp%s.js' % extra,
+        ]
+        return forms.Media(js=['admin/js/%s' % url for url in js])
 
 class InlineDocumentAdmin(BaseDocumentAdmin):
     """
